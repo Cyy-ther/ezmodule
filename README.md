@@ -22,6 +22,9 @@ This project is currently known to work on Arch Linux. It has not been tested on
 - Check for likely module conflicts with `--check-conflicts`
 - Detect stale DKMS/module artifacts with `--orphan-check`
 - Scan for failed modules and DKMS builds with `--failed-check`
+- Show a kernel health summary with `--health` / `--health-check`
+- Explain why a module is loaded or cannot be removed with `--why MODULE`
+- Preview actions without executing them with `--dry-run`
 - Decode kernel taint status with `--taint`
 - Show hardware-to-driver mappings with `--hw [DEVICE_PATTERN]`
 - Clean up ezmodule-managed config files with `--clean` / `--reset`
@@ -194,6 +197,32 @@ sudo ezmodule --failed-check
 ```
 
 This will report failed DKMS build logs and kernel-load errors, and include commands for reading the relevant log files.
+
+### Show a kernel health summary
+
+```bash
+ezmodule --health
+```
+
+This combines the most useful module-health checks in one place: taint bitmask, failed DKMS/module builds, stale orphaned DKMS artifacts, loaded conflict hints, and in-use module warnings.
+
+### Explain why a module cannot be removed
+
+```bash
+ezmodule --why zram
+```
+
+This inspects `/proc/modules`, checks refcount and holder modules, and explains whether the module is still in use and what action is needed before unloading it.
+
+### Preview a module action without executing it
+
+```bash
+ezmodule --dry-run -D zram
+# or
+sudo ezmodule --dry-run -E vfio
+```
+
+This prints the dependency chain and the exact `modprobe` command that would run without making any live changes.
 
 ### Decode taint state
 
