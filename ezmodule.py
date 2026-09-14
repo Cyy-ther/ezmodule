@@ -1069,6 +1069,38 @@ def resolve_dkms_spec(module: str) -> dict[str, str] | None:
     return None
 
 
+def resolve_dkms_load_targets(dkms_package: str, version: str | None = None, kernel_release: str | None = None) -> list[str]:
+    pkg_root = Path("/var/lib/dkms") / dkms_package
+    if not pkg_root.exists():
+        return []
+
+    candidates: set[str] = set()
+    if version:
+        build_dirs = [pkg_root / version / "build"]
+    else:
+        build_dirs = sorted((item / "build" for item in pkg_root.iterdir() if item.is_dir()), key=lambda p: str(p))
+
+    for build_dir in build_dirs:
+        if not build_dir.exists():
+            continue
+        for path in build_dir.rglob("*.ko"):
+            candidates.add(normalize_module_name(str(path)))
+        for path in build_dir.rglob("*.ko.xz"):
+            candidates.add(normalize_module_name(str(path)))
+        for path in build_dir.rglob("*.ko.zst"):
+            candidates.add(normalize_module_name(str(path)))
+        for path in build_dir.rglob("*.ko.gz"):
+            candidates.add(normalize_module_name(str(path)))
+
+    if not candidates and kernel_release:
+        module_dir = Path("/lib/modules") / kernel_release / "updates" / "dkms"
+        if module_dir.exists():
+            for path in module_dir.rglob("*.ko*"):
+                candidates.add(normalize_module_name(str(path)))
+
+    return sorted(candidates)
+
+
 def apply_dkms_action(module: str, action: str) -> int:
     require_root()
     if shutil.which("dkms") is None:
@@ -1100,11 +1132,28 @@ def apply_dkms_action(module: str, action: str) -> int:
                     sys.stderr.write("No build log was found. Ensure the DKMS package source and kernel headers are installed.\n")
                 sys.stderr.write(result.stderr or result.stdout or "")
                 return result.returncode
-        modprobe_result = run(["modprobe", module])
-        if modprobe_result.returncode != 0:
-            sys.stderr.write(modprobe_result.stderr or modprobe_result.stdout or f"Failed to load DKMS module {module}\n")
-            return modprobe_result.returncode
-        print(f"Enabled DKMS module {module}")
+
+        load_targets = resolve_dkms_load_targets(dkms_spec["module"], dkms_spec["version"], kernel_release)
+        if not load_targets:
+            log_path = Path("/var/lib/dkms") / dkms_spec["module"] / dkms_spec["version"] / "build" / "make.log"
+            print(f"DKMS package {module} is installed for kernel {kernel_release}, but it did not produce a loadable kernel module.")
+            print("This package is not a valid modprobe target for this kernel.")
+            if log_path.exists():
+                print(f"Check the build log: tail -n 80 '{log_path}'")
+            else:
+                print("Check 'dkms status' and the package source to confirm whether the DKMS module is valid for your kernel.")
+            return 0
+
+        for target in load_targets:
+            modprobe_result = run(["modprobe", target])
+            if modprobe_result.returncode == 0:
+                print(f"Enabled DKMS module {module} via {target}")
+                return 0
+            if "not found" not in (modprobe_result.stderr or modprobe_result.stdout or "").lower():
+                sys.stderr.write(modprobe_result.stderr or modprobe_result.stdout or f"Failed to load DKMS module {target}\n")
+                return modprobe_result.returncode
+
+        sys.stderr.write(f"DKMS package {module} installed successfully, but no runnable kernel module was found for {kernel_release}.\n")
         return 0
 
     if action in {"disable", "remove"}:
