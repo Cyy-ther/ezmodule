@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -428,6 +429,392 @@ def orphan_check() -> int:
     return 0
 
 
+def show_module_holders(module: str) -> int:
+    proc_path = Path("/proc/modules")
+    if not proc_path.exists():
+        print(f"No /proc/modules entry exists for {module}.")
+        return 1
+
+    holders: list[str] = []
+    for line in proc_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[0]
+        if name == module:
+            if parts[3] == "-":
+                print(f"Holders for {module}:")
+                print("  (none)")
+                return 0
+            holders = [item.strip() for item in parts[3].split(",") if item.strip()]
+            break
+    if not holders:
+        for line in proc_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            if module in [item.strip() for item in parts[3].split(",") if item.strip()]:
+                holders.append(parts[0])
+
+    print(f"Holders for {module}:")
+    if not holders:
+        print("  (none)")
+        return 0
+
+    for idx, holder in enumerate(sorted(set(holders))):
+        branch = "└─" if idx == len(sorted(set(holders))) - 1 else "├─"
+        print(f"  {branch} {holder}")
+    return 0
+
+
+def persist_module_param(module: str, assignment: str) -> int:
+    require_root()
+    if "=" not in assignment:
+        sys.stderr.write("Parameter assignment must be in KEY=VALUE form.\n")
+        return 2
+
+    key, value = assignment.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        sys.stderr.write("Parameter name cannot be empty.\n")
+        return 2
+
+    config_path = Path("/etc/modprobe.d/ezmodule.conf")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: set[str] = set()
+    if config_path.exists():
+        for line in config_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            cleaned = line.strip()
+            if cleaned and not cleaned.startswith("#"):
+                existing.add(cleaned)
+
+    option_line = f"options {module} {key}={value}"
+    if option_line not in existing:
+        with config_path.open("a", encoding="utf-8") as handle:
+            if config_path.stat().st_size and not config_path.read_text(encoding="utf-8", errors="replace").endswith("\n"):
+                handle.write("\n")
+            handle.write(f"{option_line}\n")
+
+    print(f"Persisted module option {module} {key}={value} in {config_path}")
+    return 0
+
+
+def resolve_alias_candidates(alias: str) -> list[str]:
+    if not alias:
+        return []
+    if shutil.which("modprobe") is not None:
+        result = run(["modprobe", "-R", alias])
+        if result.returncode == 0 and result.stdout.strip():
+            modules = []
+            for line in result.stdout.splitlines():
+                for token in line.split():
+                    if token and token not in {"alias", alias} and not token.startswith("/"):
+                        modules.append(token)
+            if modules:
+                return sorted(set(modules))
+
+    kernel = detect_kernel_release()
+    alias_path = Path("/lib/modules") / kernel / "modules.alias"
+    if not alias_path.exists():
+        return []
+
+    matches: list[str] = []
+    alias_pattern = alias.replace("*", "*")
+    for line in alias_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        if " " not in line:
+            continue
+        _, value = line.split(None, 1)
+        if value.strip() == "":
+            continue
+        try:
+            if fnmatch.fnmatch(alias, alias_pattern) and alias in line:
+                matches.append(line.split()[-1])
+        except re.error:
+            pass
+        if alias in line:
+            matches.append(line.split()[-1])
+    return sorted(set(matches))
+
+
+def _list_hw_devices(bus_name: str, pattern: str | None = None) -> list[dict[str, str]]:
+    bus_dir = Path("/sys/bus") / bus_name / "devices"
+    if not bus_dir.exists():
+        return []
+
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for device_path in sorted(bus_dir.iterdir()):
+        if not device_path.is_dir():
+            continue
+
+        name = device_path.name
+        if bus_name == "usb":
+            if name.startswith("usb"):
+                continue
+            if ":" in name:
+                continue
+            if not re.fullmatch(r"\d+-\d+(?:\.\d+)*", name):
+                continue
+
+        driver = "none"
+        driver_path = device_path / "driver"
+        if driver_path.exists() and driver_path.is_symlink():
+            driver = driver_path.resolve().name
+        driver_lower = driver.lower()
+        if bus_name == "usb" and ("hub" in driver_lower or driver_lower in {"usbcore"}):
+            continue
+
+        modalias = ""
+        modalias_path = device_path / "modalias"
+        if modalias_path.exists():
+            modalias = modalias_path.read_text(encoding="utf-8", errors="replace").strip()
+
+        product = ""
+        product_path = device_path / "product"
+        if product_path.exists():
+            product = product_path.read_text(encoding="utf-8", errors="replace").strip()
+
+        manufacturer = ""
+        manufacturer_path = device_path / "manufacturer"
+        if manufacturer_path.exists():
+            manufacturer = manufacturer_path.read_text(encoding="utf-8", errors="replace").strip()
+
+        if bus_name == "usb" and ("hub" in product.lower() or "hub" in manufacturer.lower() or "hub" in driver_lower):
+            continue
+
+        matches = resolve_alias_candidates(modalias)
+        if pattern:
+            needle = pattern.lower()
+            if (
+                needle not in name.lower()
+                and needle not in driver.lower()
+                and needle not in modalias.lower()
+                and needle not in product.lower()
+                and needle not in manufacturer.lower()
+                and not any(needle in item.lower() for item in matches)
+            ):
+                continue
+
+        key = f"{bus_name}:{name}"
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "device": name,
+            "driver": driver,
+            "modalias": modalias,
+            "product": product,
+            "manufacturer": manufacturer,
+            "matches": ", ".join(matches) if matches else "(none)",
+        })
+
+    return sorted(results, key=lambda row: row["device"])
+
+
+def show_hw_map(pattern: str | None = None) -> int:
+    bus_names = ["pci", "usb"]
+    rows: list[dict[str, str]] = []
+    for bus in bus_names:
+        rows.extend(_list_hw_devices(bus, pattern))
+
+    if not rows:
+        print("No matching hardware devices were found.")
+        return 0
+
+    print("Hardware / driver mapping:")
+    for row in rows:
+        print(f"  - {row['device']}")
+        if row["manufacturer"] or row["product"]:
+            label = ", ".join(part for part in [row["manufacturer"], row["product"]] if part)
+            print(f"      device: {label}")
+        print(f"      driver: {row['driver']}")
+        if row["modalias"]:
+            print(f"      modalias: {row['modalias']}")
+        print(f"      possible modules: {row['matches']}")
+    return 0
+
+
+def decode_kernel_taint(value: int) -> list[str]:
+    flags = {
+        1: ("P", "proprietary module loaded"),
+        2: ("F", "module force-loaded"),
+        4: ("S", "module signed"),
+        8: ("R", "module built with unsafe conditions"),
+        16: ("M", "module from a memory block"),
+        32: ("B", "bad page state"),
+        64: ("U", "unresolved symbol"),
+        128: ("D", "debug kernel"),
+        256: ("A", "module was forced to load"),
+        512: ("W", "warning flag set"),
+        1024: ("C", "staging module or non-open-source module"),
+        2048: ("I", "module was loaded out-of-tree"),
+        4096: ("O", "out-of-tree module loaded"),
+        8192: ("E", "module unsigned or tainted externally"),
+        16384: ("L", "lockdep warning"),
+        32768: ("K", "kernel live patch applied"),
+    }
+    active: list[str] = []
+    for bit, (label, description) in sorted(flags.items()):
+        if value & bit:
+            active.append(f"  [!] {description} ({label})")
+    return active
+
+
+def show_kernel_taint() -> int:
+    taint_path = Path("/proc/sys/kernel/tainted")
+    if not taint_path.exists():
+        print("Kernel taint information is unavailable on this system.")
+        return 1
+
+    try:
+        value = int(taint_path.read_text(encoding="utf-8", errors="replace").strip() or "0")
+    except ValueError:
+        print("Kernel taint value could not be parsed.")
+        return 1
+
+    print(f"Kernel Taint Value: {value} (0x{value:x})")
+    flags = decode_kernel_taint(value)
+    if not flags:
+        print("  [OK] Kernel is not tainted.")
+        return 0
+    for flag in flags:
+        print(flag)
+    return 0
+
+
+def clean_ezmodule_configs() -> int:
+    require_root()
+    targets = [
+        Path("/etc/modules-load.d/ezmodule.conf"),
+        Path("/etc/modprobe.d/ezmodule.conf"),
+        Path("/etc/modprobe.d/ezmodule-blacklist.conf"),
+    ]
+    removed = 0
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            removed += 1
+            print(f"Removed {path}")
+    if removed == 0:
+        print("No ezmodule-managed config files were found to clean up.")
+    return 0
+
+
+def failed_module_scan() -> int:
+    failures: list[dict[str, str]] = []
+
+    dkms_status = run(["dkms", "status"])
+    if dkms_status.returncode == 0:
+        for line in dkms_status.stdout.splitlines():
+            lower = line.lower()
+            if "error" in lower or "failed" in lower or "not built" in lower:
+                failures.append({
+                    "module": line.split(",", 1)[0].strip(),
+                    "version": "dkms-status",
+                    "reason": line.strip(),
+                    "log": "dkms status",
+                })
+
+    dkms_root = Path("/var/lib/dkms")
+    if dkms_root.exists():
+        for module_dir in sorted(dkms_root.iterdir()):
+            if not module_dir.is_dir():
+                continue
+            for version_dir in sorted(module_dir.iterdir()):
+                if not version_dir.is_dir():
+                    continue
+                log_path = version_dir / "build" / "make.log"
+                if not log_path.exists():
+                    continue
+                log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                lower = log_text.lower()
+                if "error:" not in lower and "error!" not in lower and "fatal" not in lower and "make: ***" not in lower and "bad return status" not in lower:
+                    continue
+
+                recent_lines = []
+                for line in log_text.splitlines()[-80:]:
+                    l = line.strip()
+                    if not l:
+                        continue
+                    if any(token in l.lower() for token in ["error", "fatal", "failed", "bad return status", "make: ***", "undefined reference", "implicit declaration"]):
+                        recent_lines.append(l)
+                reason = recent_lines[-3:] if recent_lines else [log_text.splitlines()[-1].strip()]
+                failures.append({
+                    "module": module_dir.name,
+                    "version": version_dir.name,
+                    "reason": " | ".join(reason),
+                    "log": str(log_path),
+                })
+
+    known_modules = set(module_names_for_listing(detect_kernel_release())[0])
+    log_sources = []
+    for cmd in (["dmesg", "-T"], ["journalctl", "-k", "--no-pager", "-n", "200"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        result = run(cmd)
+        if result.returncode == 0 and result.stdout.strip():
+            log_sources.append(result.stdout)
+
+    for text in log_sources:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if "modprobe" not in lower and "insmod" not in lower and "could not insert" not in lower and "module" not in lower:
+                continue
+            if not any(token in lower for token in ["error", "failed", "fatal", "not found", "not currently loaded", "init_module", "unknown symbol", "undefined symbol", "could not insert"]):
+                continue
+
+            module_name = "unknown"
+            candidates = [token for token in re.findall(r"[A-Za-z0-9_.+-]+", stripped) if token in known_modules]
+            if candidates:
+                module_name = candidates[0]
+            else:
+                match = re.search(r"(?:modprobe|insmod)[^\n]*?(?:['\"]([A-Za-z0-9_.+-]+)['\"]|\b([A-Za-z0-9_.+-]+)\b)", stripped, flags=re.IGNORECASE)
+                if match:
+                    module_name = next((value for value in match.groups() if value), "unknown")
+
+            if module_name in {"unknown", "modprobe", "insmod", "kernel"}:
+                continue
+
+            failures.append({
+                "module": module_name,
+                "version": "kernel-log",
+                "reason": stripped,
+                "log": "kernel log",
+            })
+
+    unique_results: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in failures:
+        key = (item["module"], item["version"]) if item["version"] != "kernel-log" else (item["module"], item["reason"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_results.append(item)
+
+    if not unique_results:
+        print("No failed modules, failed loads, or failed DKMS builds were detected.")
+        return 0
+
+    print("Failed modules / module load errors / DKMS builds:")
+    for item in unique_results:
+        print(f"  - {item['module']} ({item['version']})")
+        print(f"      reason: {item['reason']}")
+        if item["log"] != "dkms status" and item["log"] != "kernel log":
+            print(f"      log: {item['log']}")
+            print(f"      read: tail -n 80 '{item['log']}'")
+            print(f"      inspect: sudo less '{item['log']}'")
+        else:
+            print("      read: sudo dmesg -T | tail -n 200")
+            print("      read: sudo journalctl -k --no-pager -n 200")
+    return 0
+
+
 def _read_tui_key() -> str | None:
     if not select.select([sys.stdin], [], [], 0.05)[0]:
         return None
@@ -742,6 +1129,23 @@ def apply_dkms_action(module: str, action: str) -> int:
     raise SystemExit(f"Unknown DKMS action: {action}")
 
 
+def get_module_usage_info(module: str) -> tuple[int, list[str], str | None]:
+    proc_modules = Path("/proc/modules")
+    if not proc_modules.exists():
+        return 0, [], None
+
+    for line in proc_modules.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if parts[0] != module:
+            continue
+        refcount = int(parts[2]) if parts[2].isdigit() else 0
+        used_by = parts[3:]
+        return refcount, used_by, " ".join(used_by)
+    return 0, [], None
+
+
 def apply_module_action(module: str, action: str) -> int:
     require_root()
     if action == "enable":
@@ -760,9 +1164,27 @@ def apply_module_action(module: str, action: str) -> int:
         return 0
 
     if action == "disable":
+        refcount, used_by, _ = get_module_usage_info(module)
+        if refcount > 0:
+            sys.stderr.write(f"Cannot disable '{module}': module is actively in use (refcount: {refcount}).\n")
+            if used_by:
+                sys.stderr.write(f"Hint: dependent modules: {', '.join(used_by)}\n")
+            if module == "zram":
+                sys.stderr.write("Hint: If this is swap, disable it first with: sudo swapoff /dev/zram0\n")
+            return 1
+
         result = run(["modprobe", "-r", module])
         if result.returncode != 0:
-            sys.stderr.write(result.stderr or result.stdout or f"Failed to unload {module}\n")
+            stderr_text = result.stderr or result.stdout or f"Failed to unload {module}\n"
+            if "in use" in stderr_text.lower() or "busy" in stderr_text.lower():
+                sys.stderr.write(f"Cannot disable '{module}': module is actively in use.\n")
+                refcount, used_by, _ = get_module_usage_info(module)
+                if refcount > 0:
+                    sys.stderr.write(f"refcount: {refcount}\n")
+                if used_by:
+                    sys.stderr.write(f"Dependent modules: {', '.join(used_by)}\n")
+            else:
+                sys.stderr.write(stderr_text)
             return result.returncode
         print(f"Disabled {module}")
         return 0
@@ -801,6 +1223,12 @@ def main() -> int:
     module_group.add_argument("--set-param", nargs=2, metavar=("MODULE", "KEY=VALUE"), help="Write a parameter value to /sys/module/<module>/parameters/<key>.")
     module_group.add_argument("--check-conflicts", metavar="MODULE", help="Check for common module conflicts and blacklist hints.")
     module_group.add_argument("--orphan-check", action="store_true", help="Scan for stale DKMS or orphaned module artifacts.")
+    module_group.add_argument("--used-by", "--holders", dest="used_by", metavar="MODULE", help="List modules currently holding a module open, using /proc/modules.")
+    module_group.add_argument("--persist-param", nargs=2, metavar=("MODULE", "KEY=VALUE"), help="Persist a module parameter in /etc/modprobe.d/ezmodule.conf.")
+    module_group.add_argument("--hw", nargs="?", const="", metavar="DEVICE_PATTERN", help="List hardware devices with their active driver and candidate modules.")
+    module_group.add_argument("--taint", action="store_true", help="Decode the kernel taint bitmask from /proc/sys/kernel/tainted.")
+    module_group.add_argument("--clean", "--reset", dest="clean", action="store_true", help="Remove ezmodule-managed config files under /etc/modules-load.d and /etc/modprobe.d.")
+    module_group.add_argument("--failed-check", action="store_true", help="Scan kernel log output and DKMS logs for failed builds or failed module loads.")
 
     action_group = parser.add_mutually_exclusive_group()
     action_group.add_argument("-E", "--enable", metavar="MODULE", help="Load a regular kernel module with modprobe.")
@@ -848,6 +1276,25 @@ def main() -> int:
         if args.orphan_check:
             return orphan_check()
 
+        if args.used_by:
+            return show_module_holders(args.used_by)
+
+        if args.persist_param:
+            module, assignment = args.persist_param
+            return persist_module_param(module, assignment)
+
+        if args.hw is not None:
+            return show_hw_map(None if args.hw == "" else args.hw)
+
+        if args.taint:
+            return show_kernel_taint()
+
+        if args.clean:
+            return clean_ezmodule_configs()
+
+        if args.failed_check:
+            return failed_module_scan()
+
         if args.dkms_enable:
             return apply_dkms_action(args.dkms_enable, "enable")
 
@@ -868,7 +1315,7 @@ def main() -> int:
             print_module_table(entries, args.kernel, args.search, dkms)
             return 0
 
-        if not args.search and not args.list and not args.list_loaded and not args.persist and not args.blacklist and not args.deps and not args.info and not args.modinfo_field and not args.params and not args.set_param and not args.check_conflicts and not args.orphan_check and not args.enable and not args.disable and not args.dkms_enable and not args.dkms_disable:
+        if not args.search and not args.list and not args.list_loaded and not args.persist and not args.blacklist and not args.deps and not args.info and not args.modinfo_field and not args.params and not args.set_param and not args.check_conflicts and not args.orphan_check and not args.used_by and not args.persist_param and args.hw is None and not args.taint and not args.clean and not args.failed_check and not args.enable and not args.disable and not args.dkms_enable and not args.dkms_disable:
             return run_interactive_menu(args.kernel)
 
         names, dkms = module_names_for_listing(args.kernel)
