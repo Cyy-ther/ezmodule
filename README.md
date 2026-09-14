@@ -116,6 +116,31 @@ export PATH="$HOME/.local/bin:$PATH"
 
 If you installed with `pip install --user`, use that PATH entry.
 
+## Initramfs rebuild notice
+
+Several ezmodule actions modify early-boot module behavior. After running any of the following, rebuild the initramfs before rebooting:
+
+- `sudo ezmodule --persist MODULE`
+- `sudo ezmodule --blacklist MODULE`
+- `sudo ezmodule --persist-param MODULE KEY=VALUE`
+- `sudo ezmodule --clean` / `sudo ezmodule --reset`
+- `sudo ezmodule --dkms-enable MODULE`
+- `sudo ezmodule --dkms-disable MODULE`
+
+Use:
+
+```bash
+sudo mkinitcpio -P
+```
+
+On systems using dracut, use:
+
+```bash
+sudo dracut -f
+```
+
+This is a safeguard for storage, display, networking, and other boot-critical drivers that may be loaded before userspace starts.
+
 ## Usage
 
 ### List modules
@@ -166,17 +191,23 @@ ezmodule --params mt7925e
 sudo ezmodule --persist vfio
 ```
 
+This writes a module-load entry under `/etc/modules-load.d/ezmodule.conf`. Because it changes early-boot behavior, ezmodule warns you to rebuild the initramfs before rebooting: `sudo mkinitcpio -P`.
+
 ### Persist a module parameter for boot
 
 ```bash
 sudo ezmodule --persist-param vfio enable_unsafe_noiommu_mode=Y
 ```
 
+This writes an `options ...` line into `/etc/modprobe.d/ezmodule.conf`; rebuild the initramfs before rebooting if the module is used during boot.
+
 ### Blacklist a module
 
 ```bash
 sudo ezmodule --blacklist nouveau
 ```
+
+This creates `/etc/modprobe.d/ezmodule-blacklist.conf` and should be followed by a rebuild of the initramfs before rebooting: `sudo mkinitcpio -P`.
 
 ### Check for conflicts
 
