@@ -113,6 +113,16 @@ def list_dkms_modules() -> list[str]:
     return sorted(modules)
 
 
+def list_dkms_status_lines() -> list[str]:
+    if shutil.which("dkms") is None:
+        return []
+    result = run(["dkms", "status"])
+    if result.returncode != 0:
+        return []
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines
+
+
 def module_names_for_listing(kernel_release: str) -> tuple[list[str], set[str]]:
     available = list_available_modules(kernel_release)
     dkms = set(list_dkms_modules())
@@ -154,8 +164,13 @@ def print_module_table(entries: list[ModuleEntry], kernel_release: str, search: 
     if dkms:
         print()
         print("DKMS packages:")
-        for name in sorted(dkms):
-            print(f"  {name}")
+        status_lines = list_dkms_status_lines()
+        if status_lines:
+            for line in status_lines:
+                print(f"  {line}")
+        else:
+            for name in sorted(dkms):
+                print(f"  {name}")
 
 
 def persist_modules(modules: list[str]) -> int:
@@ -385,17 +400,18 @@ def find_module_conflicts(module: str) -> list[str]:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            if f"blacklist {module}" in stripped or f"install {module}" in stripped or f"alias {module}" in stripped:
+            if re.search(rf"(?<!\S)(?:blacklist|install|alias)\s+{re.escape(module)}(?:\s|$)", stripped):
                 candidates.add(path.name)
-            if module in stripped:
-                candidates.add(stripped)
 
     loaded = list_loaded_modules()
-    for other in sorted(loaded):
-        if other == module:
-            continue
-        if any(other.startswith(prefix) for prefix in ["mt79", "i915", "ath", "nvidia", "nouveau", "r81"]):
-            candidates.add(other)
+    prefixes = ["mt79", "i915", "ath", "nvidia", "nouveau", "r81"]
+    matching_prefix = next((prefix for prefix in prefixes if module.startswith(prefix)), None)
+    if matching_prefix:
+        for other in sorted(loaded):
+            if other == module:
+                continue
+            if other.startswith(matching_prefix):
+                candidates.add(other)
 
     return sorted(candidates)
 
@@ -429,6 +445,27 @@ def orphan_check() -> int:
     return 0
 
 
+def clean_module_holders(tokens: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        value = token.strip().strip(",")
+        if not value:
+            continue
+        if value.startswith("0x"):
+            continue
+        if value.startswith("(") and value.endswith(")"):
+            continue
+        if value.lower() in {"live", "loading", "unloading", "state"}:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_]+", value):
+            continue
+        if value not in seen:
+            cleaned.append(value)
+            seen.add(value)
+    return sorted(cleaned)
+
+
 def show_module_holders(module: str) -> int:
     proc_path = Path("/proc/modules")
     if not proc_path.exists():
@@ -443,17 +480,16 @@ def show_module_holders(module: str) -> int:
         name = parts[0]
         if name == module:
             if parts[3] == "-":
-                print(f"Holders for {module}:")
-                print("  (none)")
-                return 0
-            holders = [item.strip() for item in parts[3].split(",") if item.strip()]
+                holders = []
+                break
+            holders = clean_module_holders(parts[3].split(","))
             break
     if not holders:
         for line in proc_path.read_text(encoding="utf-8", errors="replace").splitlines():
             parts = line.split()
             if len(parts) < 4:
                 continue
-            if module in [item.strip() for item in parts[3].split(",") if item.strip()]:
+            if module in clean_module_holders(parts[3].split(",")):
                 holders.append(parts[0])
 
     print(f"Holders for {module}:")
@@ -682,6 +718,38 @@ def show_kernel_taint() -> int:
         return 0
     for flag in flags:
         print(flag)
+    return 0
+
+
+def health_summary() -> int:
+    print("Kernel health summary")
+    print("=" * 20)
+    show_kernel_taint()
+    print()
+    print("Failed modules / DKMS build issues")
+    failed_module_scan()
+    print()
+    print("Stale DKMS / orphaned artifacts")
+    orphan_check()
+    print()
+    print("Loaded module conflict hints")
+    loaded = sorted(list_loaded_modules())
+    for name in loaded:
+        conflicts = find_module_conflicts(name)
+        if conflicts:
+            print(f"  - {name}: {', '.join(conflicts[:5])}")
+    if not any(find_module_conflicts(name) for name in loaded):
+        print("  (none)")
+    print()
+    print("Active module usage hints")
+    seen = 0
+    for name in sorted(loaded):
+        refcount, used_by, _ = get_module_usage_info(name)
+        if refcount > 0:
+            seen += 1
+            print(f"  - {name}: refcount={refcount}, holders={', '.join(sorted(set(used_by))) if used_by else 'none'}")
+    if seen == 0:
+        print("  (none)")
     return 0
 
 
@@ -1101,8 +1169,9 @@ def resolve_dkms_load_targets(dkms_package: str, version: str | None = None, ker
     return sorted(candidates)
 
 
-def apply_dkms_action(module: str, action: str) -> int:
-    require_root()
+def apply_dkms_action(module: str, action: str, dry_run: bool = False) -> int:
+    if not dry_run:
+        require_root()
     if shutil.which("dkms") is None:
         sys.stderr.write("dkms is not installed on this system.\n")
         return 1
@@ -1190,15 +1259,53 @@ def get_module_usage_info(module: str) -> tuple[int, list[str], str | None]:
         if parts[0] != module:
             continue
         refcount = int(parts[2]) if parts[2].isdigit() else 0
-        used_by = parts[3:]
-        return refcount, used_by, " ".join(used_by)
+        holder_field = parts[3] if len(parts) > 3 else "-"
+        holders: list[str] = []
+        if holder_field != "-":
+            holders = clean_module_holders(holder_field.split(","))
+        return refcount, holders, ", ".join(holders) if holders else None
     return 0, [], None
 
 
-def apply_module_action(module: str, action: str) -> int:
-    require_root()
+def explain_module_state(module: str) -> int:
+    loaded = module in list_loaded_modules()
+    refcount, used_by, _ = get_module_usage_info(module)
+    deps = list_module_dependencies(module)
+    print(f"Module: {module}")
+    print(f"  Loaded: {'yes' if loaded else 'no'}")
+    print(f"  Refcount: {refcount}")
+    if used_by:
+        print(f"  Currently used by: {', '.join(sorted(set(used_by)))}")
+    else:
+        print("  Currently used by: none")
+    if deps:
+        print(f"  Dependencies: {', '.join(deps)}")
+    else:
+        print("  Dependencies: none reported")
+
+    if refcount > 0:
+        print("  Why it cannot be removed: the module is actively referenced by live kernel consumers.")
+        if module == "zram":
+            print("  Suggested fix: sudo swapoff /dev/zram0")
+        if module == "drm":
+            print("  Suggested fix: stop the graphics stack or disable the relevant driver before unloading.")
+    elif not loaded:
+        print("  Why it cannot be removed: it is not currently loaded.")
+    else:
+        print("  Removal should be possible unless another subsystem still references it.")
+    return 0
+
+
+def apply_module_action(module: str, action: str, dry_run: bool = False) -> int:
+    if not dry_run:
+        require_root()
     if action == "enable":
         dependencies = list_module_dependencies(module)
+        if dry_run:
+            print(f"DRY RUN: would load dependencies: {', '.join(dependencies) if dependencies else '(none)'}")
+            print(f"DRY RUN: would run: modprobe {module}")
+            return 0
+
         for dependency in dependencies:
             dependency_result = run(["modprobe", dependency])
             if dependency_result.returncode != 0:
@@ -1214,6 +1321,14 @@ def apply_module_action(module: str, action: str) -> int:
 
     if action == "disable":
         refcount, used_by, _ = get_module_usage_info(module)
+        if dry_run:
+            print(f"DRY RUN: would attempt: modprobe -r {module}")
+            if refcount > 0:
+                print(f"DRY RUN: module is in use (refcount: {refcount})")
+                if used_by:
+                    print(f"DRY RUN: holders: {', '.join(sorted(set(used_by)))}")
+            return 0
+
         if refcount > 0:
             sys.stderr.write(f"Cannot disable '{module}': module is actively in use (refcount: {refcount}).\n")
             if used_by:
@@ -1278,6 +1393,10 @@ def main() -> int:
     module_group.add_argument("--taint", action="store_true", help="Decode the kernel taint bitmask from /proc/sys/kernel/tainted.")
     module_group.add_argument("--clean", "--reset", dest="clean", action="store_true", help="Remove ezmodule-managed config files under /etc/modules-load.d and /etc/modprobe.d.")
     module_group.add_argument("--failed-check", action="store_true", help="Scan kernel log output and DKMS logs for failed builds or failed module loads.")
+    module_group.add_argument("--health", "--health-check", dest="health", action="store_true", help="Print a concise kernel health summary: taint state, failed modules, stale artifacts, and current in-use modules.")
+    module_group.add_argument("--why", dest="why", metavar="MODULE", help="Explain why a module can or cannot be removed, including use count and holders.")
+
+    parser.add_argument("--dry-run", action="store_true", help="Print the intended modprobe/modprobe -r operation without executing it.")
 
     action_group = parser.add_mutually_exclusive_group()
     action_group.add_argument("-E", "--enable", metavar="MODULE", help="Load a regular kernel module with modprobe.")
@@ -1291,9 +1410,12 @@ def main() -> int:
 
     try:
         if args.enable and args.persist:
-            result = apply_module_action(args.enable, "enable")
+            result = apply_module_action(args.enable, "enable", args.dry_run)
             if result != 0:
                 return result
+            if args.dry_run:
+                print(f"DRY RUN: would persist {args.enable} in /etc/modules-load.d/ezmodule.conf")
+                return 0
             return persist_modules([args.enable])
 
         if args.persist:
@@ -1328,6 +1450,9 @@ def main() -> int:
         if args.used_by:
             return show_module_holders(args.used_by)
 
+        if args.why:
+            return explain_module_state(args.why)
+
         if args.persist_param:
             module, assignment = args.persist_param
             return persist_module_param(module, assignment)
@@ -1341,19 +1466,28 @@ def main() -> int:
         if args.clean:
             return clean_ezmodule_configs()
 
+        if args.health:
+            return health_summary()
+
         if args.failed_check:
             return failed_module_scan()
 
         if args.dkms_enable:
+            if args.dry_run:
+                print(f"DRY RUN: would run: dkms install -k {detect_kernel_release()} {args.dkms_enable}")
+                return 0
             return apply_dkms_action(args.dkms_enable, "enable")
 
         if args.dkms_disable:
+            if args.dry_run:
+                print(f"DRY RUN: would run: dkms remove -k {detect_kernel_release()} {args.dkms_disable}")
+                return 0
             return apply_dkms_action(args.dkms_disable, "disable")
 
         if args.enable:
-            return apply_module_action(args.enable, "enable")
+            return apply_module_action(args.enable, "enable", args.dry_run)
         if args.disable:
-            return apply_module_action(args.disable, "disable")
+            return apply_module_action(args.disable, "disable", args.dry_run)
 
         if args.list or args.list_loaded:
             names, dkms = module_names_for_listing(args.kernel)
@@ -1364,7 +1498,7 @@ def main() -> int:
             print_module_table(entries, args.kernel, args.search, dkms)
             return 0
 
-        if not args.search and not args.list and not args.list_loaded and not args.persist and not args.blacklist and not args.deps and not args.info and not args.modinfo_field and not args.params and not args.set_param and not args.check_conflicts and not args.orphan_check and not args.used_by and not args.persist_param and args.hw is None and not args.taint and not args.clean and not args.failed_check and not args.enable and not args.disable and not args.dkms_enable and not args.dkms_disable:
+        if not args.search and not args.list and not args.list_loaded and not args.persist and not args.blacklist and not args.deps and not args.info and not args.modinfo_field and not args.params and not args.set_param and not args.check_conflicts and not args.orphan_check and not args.used_by and not args.why and not args.persist_param and args.hw is None and not args.taint and not args.clean and not args.health and not args.failed_check and not args.enable and not args.disable and not args.dkms_enable and not args.dkms_disable:
             return run_interactive_menu(args.kernel)
 
         names, dkms = module_names_for_listing(args.kernel)
