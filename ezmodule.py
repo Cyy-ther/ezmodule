@@ -173,6 +173,16 @@ def print_module_table(entries: list[ModuleEntry], kernel_release: str, search: 
                 print(f"  {name}")
 
 
+def print_initramfs_warning(action: str, target: str | None = None) -> None:
+    print()
+    print("[!] IMPORTANT: rebuild your initramfs before rebooting.")
+    if target:
+        print(f"    The change to '{target}' may affect early-boot module loading.")
+    print("    Run: sudo mkinitcpio -P")
+    print("    or, on some systems: sudo dracut -f")
+    print()
+
+
 def persist_modules(modules: list[str]) -> int:
     require_root()
     config_path = Path("/etc/modules-load.d/ezmodule.conf")
@@ -195,6 +205,7 @@ def persist_modules(modules: list[str]) -> int:
             existing.add(module)
 
     print(f"Persisted modules to {config_path}")
+    print_initramfs_warning("persist", ", ".join(modules))
     return 0
 
 
@@ -216,6 +227,7 @@ def blacklist_module(module: str) -> int:
             handle.write(f"blacklist {module}\n")
 
     print(f"Blacklisted {module} in {config_path}")
+    print_initramfs_warning("blacklist", module)
     return 0
 
 
@@ -533,6 +545,7 @@ def persist_module_param(module: str, assignment: str) -> int:
             handle.write(f"{option_line}\n")
 
     print(f"Persisted module option {module} {key}={value} in {config_path}")
+    print_initramfs_warning("persist-param", f"{module} {key}={value}")
     return 0
 
 
@@ -768,6 +781,8 @@ def clean_ezmodule_configs() -> int:
             print(f"Removed {path}")
     if removed == 0:
         print("No ezmodule-managed config files were found to clean up.")
+    else:
+        print_initramfs_warning("clean", "ezmodule config files")
     return 0
 
 
@@ -1211,18 +1226,21 @@ def apply_dkms_action(module: str, action: str, dry_run: bool = False) -> int:
                 print(f"Check the build log: tail -n 80 '{log_path}'")
             else:
                 print("Check 'dkms status' and the package source to confirm whether the DKMS module is valid for your kernel.")
+            print_initramfs_warning("dkms-enable", module)
             return 0
 
         for target in load_targets:
             modprobe_result = run(["modprobe", target])
             if modprobe_result.returncode == 0:
                 print(f"Enabled DKMS module {module} via {target}")
+                print_initramfs_warning("dkms-enable", module)
                 return 0
             if "not found" not in (modprobe_result.stderr or modprobe_result.stdout or "").lower():
                 sys.stderr.write(modprobe_result.stderr or modprobe_result.stdout or f"Failed to load DKMS module {target}\n")
                 return modprobe_result.returncode
 
         sys.stderr.write(f"DKMS package {module} installed successfully, but no runnable kernel module was found for {kernel_release}.\n")
+        print_initramfs_warning("dkms-enable", module)
         return 0
 
     if action in {"disable", "remove"}:
@@ -1242,6 +1260,7 @@ def apply_dkms_action(module: str, action: str, dry_run: bool = False) -> int:
             sys.stderr.write(result.stderr or result.stdout or f"Failed to remove DKMS module {module}\n")
             return result.returncode
         print(f"Disabled DKMS module {module}")
+        print_initramfs_warning("dkms-disable", module)
         return 0
 
     raise SystemExit(f"Unknown DKMS action: {action}")
